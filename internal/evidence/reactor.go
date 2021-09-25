@@ -14,9 +14,8 @@ import (
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/libp2p/go-libp2p-core/protocol"
 
-	clist "github.com/tendermint/tendermint/internal/libs/clist"
+	"github.com/tendermint/tendermint/internal/libs/clist"
 	tmsync "github.com/tendermint/tendermint/internal/libs/sync"
-	"github.com/tendermint/tendermint/internal/p2p"
 	"github.com/tendermint/tendermint/libs/log"
 	"github.com/tendermint/tendermint/libs/service"
 	tmproto "github.com/tendermint/tendermint/proto/tendermint/types"
@@ -25,32 +24,10 @@ import (
 
 var (
 	_ service.Service = (*Reactor)(nil)
-
-	// ChannelShims contains a map of ChannelDescriptorShim objects, where each
-	// object wraps a reference to a legacy p2p ChannelDescriptor and the corresponding
-	// p2p proto.Message the new p2p Channel is responsible for handling.
-	//
-	//
-	// TODO: Remove once p2p refactor is complete.
-	// ref: https://github.com/tendermint/tendermint/issues/5670
-	ChannelShims = map[p2p.ChannelID]*p2p.ChannelDescriptorShim{
-		EvidenceChannel: {
-			MsgType: new(tmproto.EvidenceList),
-			Descriptor: &p2p.ChannelDescriptor{
-				ID:                  byte(EvidenceChannel),
-				Priority:            6,
-				RecvMessageCapacity: maxMsgSize,
-				RecvBufferCapacity:  32,
-				MaxSendBytes:        400,
-			},
-		},
-	}
 )
 
 const (
-	EvidenceChannel = p2p.ChannelID(0x38)
-
-	maxMsgSize = 1048576 // 1MB TODO make it configurable
+	Protocol protocol.ID = "/evidence/0.1.0"
 
 	// broadcast all uncommitted evidence this often. This sets when the reactor
 	// goes back to the start of the list and begins sending the evidence again.
@@ -58,8 +35,6 @@ const (
 	// just over the block production rate before sending evidence again.
 	broadcastEvidenceIntervalS = 10
 )
-
-const Protocol protocol.ID = "/evidence/0.1.0"
 
 // Reactor handles evpool evidence broadcasting amongst peers.
 type Reactor struct {
