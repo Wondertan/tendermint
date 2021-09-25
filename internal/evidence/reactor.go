@@ -1,10 +1,18 @@
 package evidence
 
 import (
+	"context"
 	"fmt"
 	"runtime/debug"
 	"sync"
 	"time"
+
+	"github.com/celestiaorg/go-libp2p-messenger"
+	"github.com/celestiaorg/go-libp2p-messenger/serde"
+	"github.com/libp2p/go-libp2p-core/host"
+	"github.com/libp2p/go-libp2p-core/network"
+	"github.com/libp2p/go-libp2p-core/peer"
+	"github.com/libp2p/go-libp2p-core/protocol"
 
 	clist "github.com/tendermint/tendermint/internal/libs/clist"
 	tmsync "github.com/tendermint/tendermint/internal/libs/sync"
@@ -51,19 +59,22 @@ const (
 	broadcastEvidenceIntervalS = 10
 )
 
+const Protocol protocol.ID = "/evidence/0.1.0"
+
 // Reactor handles evpool evidence broadcasting amongst peers.
 type Reactor struct {
 	service.BaseService
 
-	evpool      *Pool
-	evidenceCh  *p2p.Channel
-	peerUpdates *p2p.PeerUpdates
-	closeCh     chan struct{}
+	evpool *Pool
 
 	peerWG sync.WaitGroup
 
 	mtx          tmsync.Mutex
-	peerRoutines map[types.NodeID]*tmsync.Closer
+	peerRoutines map[peer.ID]*tmsync.Closer
+
+	msgr   *msngr.Messenger
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewReactor returns a reference to a new evidence reactor, which implements the
@@ -71,20 +82,28 @@ type Reactor struct {
 // envelopes with EvidenceList messages.
 func NewReactor(
 	logger log.Logger,
-	evidenceCh *p2p.Channel,
-	peerUpdates *p2p.PeerUpdates,
+	host host.Host,
 	evpool *Pool,
-) *Reactor {
+) (*Reactor, error) {
+	msgr, err := msngr.New(host,
+		msngr.WithProtocols(Protocol),
+		msngr.WithMessageType(&tmproto.EvidenceList{}),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
 	r := &Reactor{
 		evpool:       evpool,
-		evidenceCh:   evidenceCh,
-		peerUpdates:  peerUpdates,
-		closeCh:      make(chan struct{}),
-		peerRoutines: make(map[types.NodeID]*tmsync.Closer),
+		peerRoutines: make(map[peer.ID]*tmsync.Closer),
+		msgr:         msgr,
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 
 	r.BaseService = *service.NewBaseService(logger, "Evidence", r)
-	return r
+	return r, nil
 }
 
 // OnStart starts separate go routines for each p2p Channel and listens for
@@ -113,23 +132,19 @@ func (r *Reactor) OnStop() {
 
 	// Close closeCh to signal to all spawned goroutines to gracefully exit. All
 	// p2p Channels should execute Close().
-	close(r.closeCh)
+	r.cancel()
 
-	// Wait for all p2p Channels to be closed before returning. This ensures we
-	// can easily reason about synchronization of all p2p Channels and ensure no
-	// panics will occur.
-	<-r.evidenceCh.Done()
-	<-r.peerUpdates.Done()
+	r.msgr.Close()
 }
 
 // handleEvidenceMessage handles envelopes sent from peers on the EvidenceChannel.
 // It returns an error only if the Envelope.Message is unknown for this channel
 // or if the given evidence is invalid. This should never be called outside of
 // handleMessage.
-func (r *Reactor) handleEvidenceMessage(envelope p2p.Envelope) error {
-	logger := r.Logger.With("peer", envelope.From)
+func (r *Reactor) handleEvidenceMessage(from peer.ID, msg serde.Message) error {
+	logger := r.Logger.With("from", from.ShortString())
 
-	switch msg := envelope.Message.(type) {
+	switch msg := msg.(type) {
 	case *tmproto.EvidenceList:
 		// TODO: Refactor the Evidence type to not contain a list since we only ever
 		// send and receive one piece of evidence at a time. Or potentially consider
@@ -162,7 +177,7 @@ func (r *Reactor) handleEvidenceMessage(envelope p2p.Envelope) error {
 // handleMessage handles an Envelope sent from a peer on a specific p2p Channel.
 // It will handle errors and any possible panics gracefully. A caller can handle
 // any error returned by sending a PeerError on the respective channel.
-func (r *Reactor) handleMessage(chID p2p.ChannelID, envelope p2p.Envelope) (err error) {
+func (r *Reactor) handleMessage(from peer.ID, msg serde.Message) (err error) {
 	defer func() {
 		if e := recover(); e != nil {
 			err = fmt.Errorf("panic in processing message: %v", e)
@@ -174,38 +189,32 @@ func (r *Reactor) handleMessage(chID p2p.ChannelID, envelope p2p.Envelope) (err 
 		}
 	}()
 
-	r.Logger.Debug("received message", "message", envelope.Message, "peer", envelope.From)
+	r.Logger.Debug("received message", "message", msg, "from", from.ShortString())
 
-	switch chID {
-	case EvidenceChannel:
-		err = r.handleEvidenceMessage(envelope)
-
-	default:
-		err = fmt.Errorf("unknown channel ID (%d) for envelope (%v)", chID, envelope)
-	}
-
-	return err
+	return r.handleEvidenceMessage(from, msg)
 }
 
 // processEvidenceCh implements a blocking event loop where we listen for p2p
 // Envelope messages from the evidenceCh.
 func (r *Reactor) processEvidenceCh() {
-	defer r.evidenceCh.Close()
-
 	for {
-		select {
-		case envelope := <-r.evidenceCh.In:
-			if err := r.handleMessage(r.evidenceCh.ID, envelope); err != nil {
-				r.Logger.Error("failed to process message", "ch_id", r.evidenceCh.ID, "envelope", envelope, "err", err)
-				r.evidenceCh.Error <- p2p.PeerError{
-					NodeID: envelope.From,
-					Err:    err,
-				}
-			}
-
-		case <-r.closeCh:
+		msg, from, err := r.msgr.Receive(r.ctx)
+		if err != nil { // only returned when context is canceled
 			r.Logger.Debug("stopped listening on evidence channel; closing...")
 			return
+		}
+
+		if err := r.handleMessage(from, msg); err != nil {
+			r.Logger.Error(
+				"failed to process message",
+				"protocol", Protocol, "from", from.ShortString(), "err", err,
+			)
+
+			// TODO: Is centralized error handling reasonable?
+			// r.evidenceCh.Error <- p2p.PeerError{
+			// 	NodeID: envelope.From,
+			// 	Err:    err,
+			// }
 		}
 	}
 }
@@ -221,14 +230,17 @@ func (r *Reactor) processEvidenceCh() {
 // connects/disconnects frequently from the broadcasting peer(s).
 //
 // REF: https://github.com/tendermint/tendermint/issues/4727
-func (r *Reactor) processPeerUpdate(peerUpdate p2p.PeerUpdate) {
-	r.Logger.Debug("received peer update", "peer", peerUpdate.NodeID, "status", peerUpdate.Status)
+func (r *Reactor) processPeerUpdate(peerUpdate msngr.PeerEvent) {
+	r.Logger.Debug("received peer update",
+		"peer", peerUpdate.ID.ShortString(),
+		"status", peerUpdate.State,
+	)
 
 	r.mtx.Lock()
 	defer r.mtx.Unlock()
 
-	switch peerUpdate.Status {
-	case p2p.PeerStatusUp:
+	switch peerUpdate.State {
+	case network.Connected:
 		// Do not allow starting new evidence broadcast loops after reactor shutdown
 		// has been initiated. This can happen after we've manually closed all
 		// peer broadcast loops and closed r.closeCh, but the router still sends
@@ -241,21 +253,21 @@ func (r *Reactor) processPeerUpdate(peerUpdate p2p.PeerUpdate) {
 		// a new done channel so we can explicitly close the goroutine if the peer
 		// is later removed, we increment the waitgroup so the reactor can stop
 		// safely, and finally start the goroutine to broadcast evidence to that peer.
-		_, ok := r.peerRoutines[peerUpdate.NodeID]
+		_, ok := r.peerRoutines[peerUpdate.ID]
 		if !ok {
 			closer := tmsync.NewCloser()
 
-			r.peerRoutines[peerUpdate.NodeID] = closer
+			r.peerRoutines[peerUpdate.ID] = closer
 			r.peerWG.Add(1)
-			go r.broadcastEvidenceLoop(peerUpdate.NodeID, closer)
+			go r.broadcastEvidenceLoop(peerUpdate.ID, closer)
 		}
 
-	case p2p.PeerStatusDown:
+	case network.NotConnected:
 		// Check if we've started an evidence broadcasting goroutine for this peer.
 		// If we have, we signal to terminate the goroutine via the channel's closure.
 		// This will internally decrement the peer waitgroup and remove the peer
 		// from the map of peer evidence broadcasting goroutines.
-		closer, ok := r.peerRoutines[peerUpdate.NodeID]
+		closer, ok := r.peerRoutines[peerUpdate.ID]
 		if ok {
 			closer.Close()
 		}
@@ -266,14 +278,12 @@ func (r *Reactor) processPeerUpdate(peerUpdate p2p.PeerUpdate) {
 // PeerUpdate messages. When the reactor is stopped, we will catch the signal and
 // close the p2p PeerUpdatesCh gracefully.
 func (r *Reactor) processPeerUpdates() {
-	defer r.peerUpdates.Close()
-
 	for {
 		select {
-		case peerUpdate := <-r.peerUpdates.Updates():
+		case peerUpdate := <-r.msgr.Events():
 			r.processPeerUpdate(peerUpdate)
 
-		case <-r.closeCh:
+		case <-r.ctx.Done():
 			r.Logger.Debug("stopped listening on peer updates channel; closing...")
 			return
 		}
@@ -291,7 +301,7 @@ func (r *Reactor) processPeerUpdates() {
 // that the peer has already received or may not be ready for.
 //
 // REF: https://github.com/tendermint/tendermint/issues/4727
-func (r *Reactor) broadcastEvidenceLoop(peerID types.NodeID, closer *tmsync.Closer) {
+func (r *Reactor) broadcastEvidenceLoop(peerID peer.ID, closer *tmsync.Closer) {
 	var next *clist.CElement
 
 	defer func() {
@@ -326,7 +336,7 @@ func (r *Reactor) broadcastEvidenceLoop(peerID types.NodeID, closer *tmsync.Clos
 				// explicitly closed to signal we should exit.
 				return
 
-			case <-r.closeCh:
+			case <-r.ctx.Done():
 				// The reactor has signaled that we are stopped and thus we should
 				// implicitly exit this peer's goroutine.
 				return
@@ -343,13 +353,10 @@ func (r *Reactor) broadcastEvidenceLoop(peerID types.NodeID, closer *tmsync.Clos
 		// and thus would not be able to process the evidence correctly. Also, the
 		// peer may receive this piece of evidence multiple times if it added and
 		// removed frequently from the broadcasting peer.
-		r.evidenceCh.Out <- p2p.Envelope{
-			To: peerID,
-			Message: &tmproto.EvidenceList{
-				Evidence: []tmproto.Evidence{*evProto},
-			},
-		}
-		r.Logger.Debug("gossiped evidence to peer", "evidence", ev, "peer", peerID)
+		r.msgr.Send(r.ctx, &tmproto.EvidenceList{
+			Evidence: []tmproto.Evidence{*evProto},
+		}, peerID)
+		r.Logger.Debug("gossiped evidence to peer", "evidence", ev, "peer", peerID.ShortString())
 
 		select {
 		case <-time.After(time.Second * broadcastEvidenceIntervalS):
@@ -364,7 +371,7 @@ func (r *Reactor) broadcastEvidenceLoop(peerID types.NodeID, closer *tmsync.Clos
 			// explicitly closed to signal we should exit.
 			return
 
-		case <-r.closeCh:
+		case <-r.ctx.Done():
 			// The reactor has signaled that we are stopped and thus we should
 			// implicitly exit this peer's goroutine.
 			return
