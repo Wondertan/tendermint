@@ -8,7 +8,7 @@ require (
 	github.com/adlio/schema v1.1.13
 	github.com/btcsuite/btcd v0.22.0-beta
 	github.com/btcsuite/btcutil v1.0.3-0.20201208143702-a53e38424cce
-	github.com/celestiaorg/go-libp2p-messenger v0.0.0-20210925172010-1bc8f9a41c37
+	github.com/celestiaorg/go-libp2p-messenger v0.0.0-20210926002714-3c353501aa32
 	github.com/fortytw2/leaktest v1.3.0
 	github.com/go-kit/kit v0.12.0
 	github.com/gogo/protobuf v1.3.2
